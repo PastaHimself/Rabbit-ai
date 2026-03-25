@@ -42,14 +42,19 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-3. Install from the package index.
+3. Install Rabbit AI from this local checkout.
 ```powershell
-pip install rabbit-ai
+pip install -r requirements.txt
+pip install --no-deps --no-build-isolation -e .
 ```
 
-For local development, install the package in editable mode instead.
+Rabbit AI now uses a PyTorch backend for retrieval and ranking. The package install needs `torch`, and the single-file fallback path also keeps `requests` and `beautifulsoup4`.
+
+Do not run `pip install rabbit-ai` on a private or offline server unless you have mirrored the package to your own index. That command asks `pip` to fetch `rabbit-ai` from the configured package index, which is why you see retries against `pypi.org`.
+
+If you prefer a one-step Windows install for private servers, run:
 ```powershell
-pip install -e .
+.\install_private.ps1
 ```
 
 4. Run the CLI assistant.
@@ -203,7 +208,7 @@ If you want a single-file build instead of the package layout, use `rabbit_ai_co
 python rabbit_ai_combined.py
 ```
 
-The single-file script mirrors the modular package and includes:
+The single-file script is a convenience snapshot and may lag behind the modular package. It includes:
 - Config and dataclasses
 - Retrieval and ranking
 - SQLite memory
@@ -214,10 +219,10 @@ The single-file script mirrors the modular package and includes:
 ## Lightweight Correctness Check
 
 Completed:
-- Cross-checked the modular package and the single-file script for interface consistency
+- Kept the modular package as the primary supported install target
 - Added `unittest` coverage for retrieval, memory, search parsing, reasoning, and engine fallbacks
-- Kept dependencies within `numpy`, `requests`, and `beautifulsoup4`
-- Confirmed there is no GPU usage, no TensorFlow, no PyTorch, and no external AI API dependency
+- Switched the retrieval and ranking backend to PyTorch
+- Confirmed there is no required GPU usage, no TensorFlow, and no external AI API dependency
 
 Blocked in this workspace:
 - Running `python -m unittest ...`

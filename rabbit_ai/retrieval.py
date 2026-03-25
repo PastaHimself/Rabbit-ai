@@ -5,7 +5,7 @@ from collections import Counter
 from dataclasses import replace
 from urllib.parse import urlparse
 
-import numpy as np
+import torch
 
 from .config import DEFAULT_STOPWORDS, RankingWeights
 from .types import Passage
@@ -44,7 +44,7 @@ def dense_keyword_query(text: str, limit: int = 8) -> str:
 class SimpleTfidfVectorizer:
     def __init__(self) -> None:
         self.vocabulary_: dict[str, int] = {}
-        self.idf_: np.ndarray | None = None
+        self.idf_: torch.Tensor | None = None
 
     def fit(self, documents: list[str]) -> "SimpleTfidfVectorizer":
         token_lists = [tokenize(doc) for doc in documents]
@@ -52,22 +52,22 @@ class SimpleTfidfVectorizer:
         self.vocabulary_ = {token: index for index, token in enumerate(vocabulary)}
         document_count = len(documents)
         if not vocabulary:
-            self.idf_ = np.zeros(0, dtype=float)
+            self.idf_ = torch.zeros(0, dtype=torch.float32)
             return self
 
-        document_frequencies = np.zeros(len(vocabulary), dtype=float)
+        document_frequencies = torch.zeros(len(vocabulary), dtype=torch.float32)
         for tokens in token_lists:
             for token in set(tokens):
                 document_frequencies[self.vocabulary_[token]] += 1.0
 
-        self.idf_ = np.log((1.0 + document_count) / (1.0 + document_frequencies)) + 1.0
+        self.idf_ = torch.log((1.0 + document_count) / (1.0 + document_frequencies)) + 1.0
         return self
 
-    def transform(self, documents: list[str]) -> np.ndarray:
+    def transform(self, documents: list[str]) -> torch.Tensor:
         if self.idf_ is None:
             raise ValueError("SimpleTfidfVectorizer must be fitted before transform().")
 
-        matrix = np.zeros((len(documents), len(self.vocabulary_)), dtype=float)
+        matrix = torch.zeros((len(documents), len(self.vocabulary_)), dtype=torch.float32)
         if not self.vocabulary_:
             return matrix
 
@@ -84,22 +84,24 @@ class SimpleTfidfVectorizer:
                 matrix[row_index, column] = tf * self.idf_[column]
         return matrix
 
-    def fit_transform(self, documents: list[str]) -> np.ndarray:
+    def fit_transform(self, documents: list[str]) -> torch.Tensor:
         self.fit(documents)
         return self.transform(documents)
 
 
-def cosine_similarity(query_vector: np.ndarray, document_matrix: np.ndarray) -> np.ndarray:
-    if document_matrix.size == 0:
-        return np.zeros(0, dtype=float)
-    query_norm = np.linalg.norm(query_vector)
-    if query_norm == 0:
-        return np.zeros(document_matrix.shape[0], dtype=float)
-    document_norms = np.linalg.norm(document_matrix, axis=1)
-    safe_norms = np.where(document_norms == 0, 1.0, document_norms)
-    scores = document_matrix @ query_vector / (safe_norms * query_norm)
-    scores = np.where(document_norms == 0, 0.0, scores)
-    return scores
+def cosine_similarity(query_vector: torch.Tensor, document_matrix: torch.Tensor) -> list[float]:
+    if document_matrix.numel() == 0:
+        return []
+
+    query_norm = torch.linalg.vector_norm(query_vector)
+    if torch.isclose(query_norm, query_vector.new_tensor(0.0)):
+        return [0.0] * len(document_matrix)
+
+    document_norms = torch.linalg.vector_norm(document_matrix, dim=1)
+    safe_norms = torch.where(document_norms == 0, torch.ones_like(document_norms), document_norms)
+    scores = torch.matmul(document_matrix, query_vector) / (safe_norms * query_norm)
+    scores = torch.where(document_norms == 0, torch.zeros_like(scores), scores)
+    return [float(value) for value in scores.tolist()]
 
 
 def keyword_overlap_score(query_text: str, candidate_text: str) -> float:
@@ -196,4 +198,3 @@ def top_relevant_chunks(query: str, text: str, *, limit: int = 3, max_chars: int
         scored.append((score, index, chunk))
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [chunk for _, _, chunk in scored[:limit] if chunk]
-

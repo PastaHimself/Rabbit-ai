@@ -1,10 +1,27 @@
 from __future__ import annotations
 
 import json
+import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
-from rabbit_ai import RabbitAI
+
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+try:
+    from rabbit_ai import RabbitAI
+except ModuleNotFoundError as exc:
+    if exc.name != "rabbit_ai":
+        raise
+    if not (ROOT / "rabbit_ai_combined.py").exists():
+        raise RuntimeError(
+            "rabbit_ai is not available. Deploy the 'rabbit_ai' folder or place "
+            "'rabbit_ai_combined.py' next to this file."
+        ) from exc
+    from rabbit_ai_combined import RabbitAI
 
 
 APP = RabbitAI()

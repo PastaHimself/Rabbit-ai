@@ -16,7 +16,7 @@ setup(
     python_requires=">=3.11",
     packages=find_packages(include=["rabbit_ai", "rabbit_ai.*"]),
     install_requires=[
-        "numpy>=1.24",
+        "torch>=2.2",
         "requests>=2.31",
         "beautifulsoup4>=4.12",
     ],
