@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import operator
 import re
 from collections import OrderedDict
 
@@ -8,6 +10,22 @@ from .retrieval import keyword_overlap_score
 from .types import Answer, MemoryRecord, Passage
 
 TIME_SENSITIVE_PATTERN = re.compile(r"\b(latest|today|current|now|recent|news|this year|yesterday|tomorrow|202\d|203\d)\b")
+LOW_SIGNAL_ANSWER_PATTERN = re.compile(
+    r"(could not find enough reliable information|found limited evidence|too fragmented to summarize clearly)",
+    re.IGNORECASE,
+)
+MATH_QUERY_PATTERN = re.compile(r"[\d\(\)\+\-\*/]|plus|minus|times|multiplied by|divided by|over", re.IGNORECASE)
+
+SAFE_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+SAFE_UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
 
 
 class Reasoner:
@@ -16,6 +34,8 @@ class Reasoner:
 
     def classify(self, query: str) -> str:
         lowered = query.lower()
+        if self._extract_math_expression(lowered):
+            return "calculation"
         if TIME_SENSITIVE_PATTERN.search(lowered):
             return "time_sensitive"
         if " vs " in lowered or "difference between" in lowered or lowered.startswith("compare "):
@@ -28,9 +48,36 @@ class Reasoner:
             return "definition"
         return "factoid"
 
+    def try_direct_answer(self, query: str) -> Answer | None:
+        expression = self._extract_math_expression(query)
+        if not expression:
+            return None
+
+        try:
+            value = self._evaluate_math_expression(expression)
+        except (SyntaxError, ValueError, ZeroDivisionError):
+            return None
+
+        if abs(value - round(value)) < 1e-9:
+            rendered = str(int(round(value)))
+        else:
+            rendered = f"{value:.6f}".rstrip("0").rstrip(".")
+
+        return Answer(
+            text=f"The answer is {rendered}.",
+            confidence=0.99,
+            used_memory=False,
+            used_web=False,
+            query_type="calculation",
+        )
+
+    @staticmethod
+    def is_low_signal_answer(text: str) -> bool:
+        return bool(LOW_SIGNAL_ANSWER_PATTERN.search(text))
+
     def compose(self, query: str, passages: list[Passage], memories: list[MemoryRecord]) -> Answer:
         query_type = self.classify(query)
-        if not passages and memories:
+        if not passages and memories and memories[0].confidence >= 0.45 and not self.is_low_signal_answer(memories[0].answer):
             top_memory = memories[0]
             return Answer(
                 text=top_memory.answer,
@@ -111,3 +158,48 @@ class Reasoner:
         memory_bonus = 0.08 if memories and memories[0].similarity > 0.65 else 0.0
         confidence = 0.2 + 0.7 * min(top_score, 1.0) + 0.05 * min(source_diversity, 3) + memory_bonus
         return round(max(0.1, min(confidence, 0.95)), 3)
+
+    @staticmethod
+    def _extract_math_expression(query: str) -> str:
+        lowered = query.lower().strip()
+        if not MATH_QUERY_PATTERN.search(lowered):
+            return ""
+
+        cleaned = lowered.rstrip("?.! ")
+        for prefix in ("what is ", "what's ", "calculate ", "compute ", "evaluate "):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):]
+                break
+
+        replacements = (
+            ("multiplied by", "*"),
+            ("divided by", "/"),
+            ("plus", "+"),
+            ("minus", "-"),
+            ("times", "*"),
+            ("over", "/"),
+        )
+        for needle, replacement in replacements:
+            cleaned = cleaned.replace(needle, replacement)
+
+        cleaned = cleaned.replace("x", "*")
+        cleaned = re.sub(r"\s+", "", cleaned)
+        if not cleaned or not re.fullmatch(r"[\d\.\+\-\*/\(\)]+", cleaned):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _evaluate_math_expression(expression: str) -> float:
+        def visit(node: ast.AST) -> float:
+            if isinstance(node, ast.Expression):
+                return visit(node.body)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return float(node.value)
+            if isinstance(node, ast.UnaryOp) and type(node.op) in SAFE_UNARY_OPERATORS:
+                return SAFE_UNARY_OPERATORS[type(node.op)](visit(node.operand))
+            if isinstance(node, ast.BinOp) and type(node.op) in SAFE_BINARY_OPERATORS:
+                return SAFE_BINARY_OPERATORS[type(node.op)](visit(node.left), visit(node.right))
+            raise ValueError("Unsupported expression")
+
+        parsed = ast.parse(expression, mode="eval")
+        return visit(parsed)

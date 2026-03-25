@@ -1,19 +1,26 @@
 from __future__ import annotations
 
 import abc
+import ast
 import json
+import math
+import operator
 import re
 import sqlite3
 import statistics
 import time
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field, replace
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from urllib.request import OpenerDirector, Request, build_opener
 
-import requests
-import torch
-from bs4 import BeautifulSoup
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 
 DEFAULT_STOPWORDS = {
@@ -51,6 +58,22 @@ DEFAULT_STOPWORDS = {
 }
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?")
 TIME_SENSITIVE_PATTERN = re.compile(r"\b(latest|today|current|now|recent|news|this year|yesterday|tomorrow|202\d|203\d)\b")
+LOW_SIGNAL_ANSWER_PATTERN = re.compile(
+    r"(could not find enough reliable information|found limited evidence|too fragmented to summarize clearly)",
+    re.IGNORECASE,
+)
+MATH_QUERY_PATTERN = re.compile(r"[\d\(\)\+\-\*/]|plus|minus|times|multiplied by|divided by|over", re.IGNORECASE)
+
+SAFE_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+SAFE_UNARY_OPERATORS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
 
 
 @dataclass(slots=True)
@@ -166,7 +189,7 @@ def dense_keyword_query(text: str, limit: int = 8) -> str:
 class SimpleTfidfVectorizer:
     def __init__(self) -> None:
         self.vocabulary_: dict[str, int] = {}
-        self.idf_: torch.Tensor | None = None
+        self.idf_: object | None = None
 
     def fit(self, documents: list[str]) -> "SimpleTfidfVectorizer":
         token_lists = [tokenize(doc) for doc in documents]
@@ -174,25 +197,48 @@ class SimpleTfidfVectorizer:
         self.vocabulary_ = {token: index for index, token in enumerate(vocabulary)}
         document_count = len(documents)
         if not vocabulary:
-            self.idf_ = torch.zeros(0, dtype=torch.float32)
+            self.idf_ = torch.zeros(0, dtype=torch.float32) if torch is not None else []
             return self
 
-        document_frequencies = torch.zeros(len(vocabulary), dtype=torch.float32)
+        if torch is not None:
+            document_frequencies = torch.zeros(len(vocabulary), dtype=torch.float32)
+            for tokens in token_lists:
+                for token in set(tokens):
+                    document_frequencies[self.vocabulary_[token]] += 1.0
+            self.idf_ = torch.log((1.0 + document_count) / (1.0 + document_frequencies)) + 1.0
+            return self
+
+        document_frequencies = [0.0] * len(vocabulary)
         for tokens in token_lists:
             for token in set(tokens):
                 document_frequencies[self.vocabulary_[token]] += 1.0
-
-        self.idf_ = torch.log((1.0 + document_count) / (1.0 + document_frequencies)) + 1.0
+        self.idf_ = [math.log((1.0 + document_count) / (1.0 + frequency)) + 1.0 for frequency in document_frequencies]
         return self
 
-    def transform(self, documents: list[str]) -> torch.Tensor:
+    def transform(self, documents: list[str]):
         if self.idf_ is None:
             raise ValueError("SimpleTfidfVectorizer must be fitted before transform().")
 
-        matrix = torch.zeros((len(documents), len(self.vocabulary_)), dtype=torch.float32)
-        if not self.vocabulary_:
+        if torch is not None:
+            matrix = torch.zeros((len(documents), len(self.vocabulary_)), dtype=torch.float32)
+            if not self.vocabulary_:
+                return matrix
+            for row_index, document in enumerate(documents):
+                counts = Counter(tokenize(document))
+                if not counts:
+                    continue
+                total_tokens = float(sum(counts.values()))
+                for token, count in counts.items():
+                    column = self.vocabulary_.get(token)
+                    if column is None:
+                        continue
+                    tf = count / total_tokens
+                    matrix[row_index, column] = tf * self.idf_[column]
             return matrix
 
+        matrix = [[0.0] * len(self.vocabulary_) for _ in documents]
+        if not self.vocabulary_:
+            return matrix
         for row_index, document in enumerate(documents):
             counts = Counter(tokenize(document))
             if not counts:
@@ -203,25 +249,41 @@ class SimpleTfidfVectorizer:
                 if column is None:
                     continue
                 tf = count / total_tokens
-                matrix[row_index, column] = tf * self.idf_[column]
+                matrix[row_index][column] = tf * self.idf_[column]
         return matrix
 
-    def fit_transform(self, documents: list[str]) -> torch.Tensor:
+    def fit_transform(self, documents: list[str]):
         self.fit(documents)
         return self.transform(documents)
 
 
-def cosine_similarity(query_vector: torch.Tensor, document_matrix: torch.Tensor) -> list[float]:
-    if document_matrix.numel() == 0:
+def cosine_similarity(query_vector, document_matrix) -> list[float]:
+    if torch is not None and hasattr(document_matrix, "numel"):
+        if document_matrix.numel() == 0:
+            return []
+        query_norm = torch.linalg.vector_norm(query_vector)
+        if torch.isclose(query_norm, query_vector.new_tensor(0.0)):
+            return [0.0] * len(document_matrix)
+        document_norms = torch.linalg.vector_norm(document_matrix, dim=1)
+        safe_norms = torch.where(document_norms == 0, torch.ones_like(document_norms), document_norms)
+        scores = torch.matmul(document_matrix, query_vector) / (safe_norms * query_norm)
+        scores = torch.where(document_norms == 0, torch.zeros_like(scores), scores)
+        return [float(value) for value in scores.tolist()]
+
+    if not document_matrix:
         return []
-    query_norm = torch.linalg.vector_norm(query_vector)
-    if torch.isclose(query_norm, query_vector.new_tensor(0.0)):
+    query_norm = math.sqrt(sum(value * value for value in query_vector))
+    if query_norm == 0:
         return [0.0] * len(document_matrix)
-    document_norms = torch.linalg.vector_norm(document_matrix, dim=1)
-    safe_norms = torch.where(document_norms == 0, torch.ones_like(document_norms), document_norms)
-    scores = torch.matmul(document_matrix, query_vector) / (safe_norms * query_norm)
-    scores = torch.where(document_norms == 0, torch.zeros_like(scores), scores)
-    return [float(value) for value in scores.tolist()]
+    scores: list[float] = []
+    for document_vector in document_matrix:
+        document_norm = math.sqrt(sum(value * value for value in document_vector))
+        if document_norm == 0:
+            scores.append(0.0)
+            continue
+        dot_product = sum(document_value * query_value for document_value, query_value in zip(document_vector, query_vector, strict=True))
+        scores.append(dot_product / (document_norm * query_norm))
+    return scores
 
 
 def keyword_overlap_score(query_text: str, candidate_text: str) -> float:
@@ -524,6 +586,269 @@ def _clean_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _class_tokens(attrs: dict[str, str]) -> set[str]:
+    return {token for token in attrs.get("class", "").split() if token}
+
+
+def _attrs_to_dict(attrs: list[tuple[str, str | None]]) -> dict[str, str]:
+    return {key: value or "" for key, value in attrs}
+
+
+class _AnchorCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._current_href = ""
+        self._current_text: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "a":
+            self._current_href = _attrs_to_dict(attrs).get("href", "")
+            self._current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._current_href:
+            self._current_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._current_href:
+            text = _clean_spaces("".join(self._current_text))
+            self.links.append((self._current_href, text))
+            self._current_href = ""
+            self._current_text = []
+
+
+class _DuckDuckGoHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[SearchResult] = []
+        self._seen_urls: set[str] = set()
+        self._result_depth = 0
+        self._link_depth = 0
+        self._snippet_depth = 0
+        self._current_href = ""
+        self._current_title: list[str] = []
+        self._current_snippet: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = _attrs_to_dict(attrs)
+        classes = _class_tokens(attr_map)
+        if tag == "div" and "result" in classes:
+            if self._result_depth == 0:
+                self._current_href = ""
+                self._current_title = []
+                self._current_snippet = []
+            self._result_depth += 1
+            return
+
+        if self._result_depth == 0:
+            return
+
+        if tag == "a":
+            href = attr_map.get("href", "")
+            if "result__a" in classes or (href and not self._current_href):
+                self._link_depth += 1
+                if not self._current_href:
+                    self._current_href = href
+                    self._current_title = []
+            if "result__snippet" in classes or "result__extras__url" in classes:
+                self._snippet_depth += 1
+            return
+
+        if "result__snippet" in classes or "result__extras__url" in classes:
+            self._snippet_depth += 1
+
+    def handle_data(self, data: str) -> None:
+        if self._link_depth > 0:
+            self._current_title.append(data)
+        if self._snippet_depth > 0:
+            self._current_snippet.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._result_depth == 0:
+            return
+
+        if tag == "a":
+            if self._link_depth > 0:
+                self._link_depth -= 1
+            if self._snippet_depth > 0:
+                self._snippet_depth -= 1
+            return
+
+        if self._snippet_depth > 0 and tag in {"span", "div"}:
+            self._snippet_depth -= 1
+
+        if tag == "div":
+            self._result_depth -= 1
+            if self._result_depth == 0:
+                self._finalize_result()
+
+    def _finalize_result(self) -> None:
+        title = _clean_spaces("".join(self._current_title))
+        snippet = _clean_spaces("".join(self._current_snippet))
+        url = DuckDuckGoSearchProvider._unwrap_url(self._current_href)
+        if title and DuckDuckGoSearchProvider._is_external_url(url) and url not in self._seen_urls:
+            self._seen_urls.add(url)
+            self.results.append(
+                SearchResult(
+                    title=title,
+                    url=url,
+                    snippet=snippet,
+                    rank=len(self.results),
+                    source=DuckDuckGoSearchProvider.name,
+                )
+            )
+        self._current_href = ""
+        self._current_title = []
+        self._current_snippet = []
+
+
+class _WikipediaSearchParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.heading = ""
+        self.first_paragraph = ""
+        self.results: list[SearchResult] = []
+        self._capture_heading = False
+        self._capture_paragraph = False
+        self._paragraph_parts: list[str] = []
+        self._in_result_item = False
+        self._current_link = ""
+        self._current_title_parts: list[str] = []
+        self._current_snippet_parts: list[str] = []
+        self._capture_title = False
+        self._capture_snippet = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attr_map = _attrs_to_dict(attrs)
+        classes = _class_tokens(attr_map)
+        if tag == "h1" and attr_map.get("id") == "firstHeading":
+            self._capture_heading = True
+            return
+        if tag == "p" and not self.first_paragraph:
+            self._capture_paragraph = True
+            self._paragraph_parts = []
+            return
+        if tag == "li" and "mw-search-result" in classes:
+            self._in_result_item = True
+            self._current_link = ""
+            self._current_title_parts = []
+            self._current_snippet_parts = []
+            return
+        if not self._in_result_item:
+            return
+        if tag == "a" and not self._current_link:
+            self._current_link = attr_map.get("href", "")
+            self._capture_title = True
+            return
+        if tag == "div" and "searchresult" in classes:
+            self._capture_snippet = True
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_heading:
+            self.heading += data
+        if self._capture_paragraph:
+            self._paragraph_parts.append(data)
+        if self._capture_title:
+            self._current_title_parts.append(data)
+        if self._capture_snippet:
+            self._current_snippet_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "h1" and self._capture_heading:
+            self.heading = _clean_spaces(self.heading)
+            self._capture_heading = False
+            return
+        if tag == "p" and self._capture_paragraph:
+            paragraph = _clean_spaces("".join(self._paragraph_parts))
+            if paragraph and not self.first_paragraph:
+                self.first_paragraph = paragraph
+            self._capture_paragraph = False
+            self._paragraph_parts = []
+            return
+        if tag == "a" and self._capture_title:
+            self._capture_title = False
+            return
+        if tag == "div" and self._capture_snippet:
+            self._capture_snippet = False
+            return
+        if tag == "li" and self._in_result_item:
+            title = _clean_spaces("".join(self._current_title_parts))
+            snippet = _clean_spaces("".join(self._current_snippet_parts))
+            if title and self._current_link:
+                self.results.append(
+                    SearchResult(
+                        title=title,
+                        url=urljoin("https://en.wikipedia.org/", self._current_link),
+                        snippet=snippet,
+                        rank=len(self.results),
+                        source=WikipediaSearchProvider.name,
+                    )
+                )
+            self._in_result_item = False
+
+
+class _ContentExtractor(HTMLParser):
+    EXCLUDED_TAGS = {"script", "style", "noscript", "svg", "img", "header", "footer", "nav", "aside", "form"}
+    PREFERRED_CONTAINERS = {"main", "article", "body"}
+    TEXT_TAGS = {"p", "li", "h1", "h2", "h3"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title = ""
+        self._title_parts: list[str] = []
+        self._capture_title = False
+        self._container_stack: list[str] = []
+        self._ignore_depth = 0
+        self._collect_text = False
+        self._text_parts: list[str] = []
+        self.blocks: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "title":
+            self._capture_title = True
+            self._title_parts = []
+            return
+
+        if tag in self.PREFERRED_CONTAINERS:
+            self._container_stack.append(tag)
+
+        if tag in self.EXCLUDED_TAGS:
+            self._ignore_depth += 1
+            return
+
+        if self._ignore_depth == 0 and self._container_stack and tag in self.TEXT_TAGS:
+            self._collect_text = True
+            self._text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_title:
+            self._title_parts.append(data)
+        if self._collect_text and self._ignore_depth == 0:
+            self._text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title":
+            self.title = _clean_spaces("".join(self._title_parts))
+            self._capture_title = False
+            self._title_parts = []
+            return
+
+        if tag in self.EXCLUDED_TAGS and self._ignore_depth > 0:
+            self._ignore_depth -= 1
+            return
+
+        if self._collect_text and tag in self.TEXT_TAGS:
+            text = _clean_spaces("".join(self._text_parts))
+            if len(text) >= 40:
+                self.blocks.append(text)
+            self._collect_text = False
+            self._text_parts = []
+
+        if tag in self.PREFERRED_CONTAINERS and self._container_stack:
+            self._container_stack.pop()
+
+
 class SearchProvider(abc.ABC):
     name = "search"
 
@@ -532,41 +857,48 @@ class SearchProvider(abc.ABC):
         raise NotImplementedError
 
 
-class DuckDuckGoSearchProvider(SearchProvider):
+class _BaseHttpClient:
+    def __init__(self, config: SearchConfig | None = None, opener: OpenerDirector | None = None) -> None:
+        self.config = config or SearchConfig()
+        self.opener = opener or build_opener()
+        self.headers = {
+            "User-Agent": self.config.user_agent,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    def _get(self, url: str, params: dict[str, str] | None = None) -> tuple[str, str, str]:
+        if params:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}{urlencode(params)}"
+
+        request = Request(url, headers=self.headers)
+        try:
+            with self.opener.open(request, timeout=self.config.timeout_seconds) as response:
+                content_type = response.headers.get("content-type", "")
+                final_url = response.geturl()
+                body = response.read().decode("utf-8", errors="ignore")
+                return final_url, body, content_type
+        except (HTTPError, URLError, TimeoutError, OSError):
+            return "", "", ""
+
+
+class DuckDuckGoSearchProvider(_BaseHttpClient, SearchProvider):
     name = "duckduckgo"
     HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
     LITE_ENDPOINT = "https://lite.duckduckgo.com/lite/"
-
-    def __init__(self, config: SearchConfig | None = None, session: requests.Session | None = None) -> None:
-        self.config = config or SearchConfig()
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": self.config.user_agent,
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        )
 
     def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
         for endpoint, parser in (
             (self.HTML_ENDPOINT, self._parse_html_results),
             (self.LITE_ENDPOINT, self._parse_lite_results),
         ):
-            html = self._download(endpoint, {"q": query})
+            _, html, _ = self._get(endpoint, {"q": query})
             if not html:
                 continue
             results = parser(html)
             if results:
                 return results[:max_results]
         return []
-
-    def _download(self, endpoint: str, params: dict[str, str]) -> str:
-        try:
-            response = self.session.get(endpoint, params=params, timeout=self.config.timeout_seconds)
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException:
-            return ""
 
     @staticmethod
     def _looks_like_challenge(html: str) -> bool:
@@ -578,34 +910,21 @@ class DuckDuckGoSearchProvider(SearchProvider):
         if cls._looks_like_challenge(html):
             return []
 
-        soup = BeautifulSoup(html, "html.parser")
-        wrappers = soup.select("div.result")
+        parser = _DuckDuckGoHtmlParser()
+        parser.feed(html)
+        if parser.results:
+            return parser.results
+
+        collector = _AnchorCollector()
+        collector.feed(html)
         results: list[SearchResult] = []
         seen_urls: set[str] = set()
-
-        if wrappers:
-            for rank, wrapper in enumerate(wrappers):
-                link = wrapper.select_one("a.result__a") or wrapper.select_one("h2 a") or wrapper.select_one("a[href]")
-                if link is None:
-                    continue
-                url = cls._unwrap_url(link.get("href", ""))
-                if not cls._is_external_url(url) or url in seen_urls:
-                    continue
-                seen_urls.add(url)
-                title = _clean_spaces(link.get_text(" ", strip=True))
-                snippet_node = wrapper.select_one(".result__snippet") or wrapper.select_one(".result__extras__url")
-                snippet = _clean_spaces(snippet_node.get_text(" ", strip=True)) if snippet_node else ""
-                results.append(SearchResult(title=title, url=url, snippet=snippet, rank=rank, source=cls.name))
-        if results:
-            return results
-
-        for rank, link in enumerate(soup.select("a[href]")):
-            title = _clean_spaces(link.get_text(" ", strip=True))
-            url = cls._unwrap_url(link.get("href", ""))
+        for href, title in collector.links:
+            url = cls._unwrap_url(href)
             if not title or not cls._is_external_url(url) or url in seen_urls:
                 continue
             seen_urls.add(url)
-            results.append(SearchResult(title=title, url=url, rank=rank, source=cls.name))
+            results.append(SearchResult(title=title, url=url, rank=len(results), source=cls.name))
             if len(results) >= 10:
                 break
         return results
@@ -615,18 +934,16 @@ class DuckDuckGoSearchProvider(SearchProvider):
         if cls._looks_like_challenge(html):
             return []
 
-        soup = BeautifulSoup(html, "html.parser")
+        collector = _AnchorCollector()
+        collector.feed(html)
         results: list[SearchResult] = []
         seen_urls: set[str] = set()
-        for rank, link in enumerate(soup.select("a[href]")):
-            title = _clean_spaces(link.get_text(" ", strip=True))
-            if not title:
-                continue
-            url = cls._unwrap_url(link.get("href", ""))
-            if not cls._is_external_url(url) or url in seen_urls:
+        for href, title in collector.links:
+            url = cls._unwrap_url(href)
+            if not title or not cls._is_external_url(url) or url in seen_urls:
                 continue
             seen_urls.add(url)
-            results.append(SearchResult(title=title, url=url, rank=rank, source=cls.name))
+            results.append(SearchResult(title=title, url=url, rank=len(results), source=cls.name))
             if len(results) >= 10:
                 break
         return results
@@ -649,105 +966,47 @@ class DuckDuckGoSearchProvider(SearchProvider):
         return parsed.scheme in {"http", "https"} and "duckduckgo.com" not in parsed.netloc.lower()
 
 
-class WikipediaSearchProvider(SearchProvider):
+class WikipediaSearchProvider(_BaseHttpClient, SearchProvider):
     name = "wikipedia"
     SEARCH_ENDPOINT = "https://en.wikipedia.org/w/index.php"
 
-    def __init__(self, config: SearchConfig | None = None, session: requests.Session | None = None) -> None:
-        self.config = config or SearchConfig()
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": self.config.user_agent,
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        )
-
     def search(self, query: str, max_results: int = 5) -> list[SearchResult]:
-        try:
-            response = self.session.get(
-                self.SEARCH_ENDPOINT,
-                params={"search": query, "title": "Special:Search", "ns0": "1"},
-                timeout=self.config.timeout_seconds,
-            )
-            response.raise_for_status()
-        except requests.RequestException:
+        final_url, html, _ = self._get(
+            self.SEARCH_ENDPOINT,
+            {"search": query, "title": "Special:Search", "ns0": "1"},
+        )
+        if not html:
             return []
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        direct_title = soup.select_one("#firstHeading")
-        if direct_title and "wikipedia.org/wiki/" in response.url:
-            snippet_node = soup.select_one("p")
-            snippet = _clean_spaces(snippet_node.get_text(" ", strip=True)) if snippet_node else ""
+        parser = _WikipediaSearchParser()
+        parser.feed(html)
+        if parser.heading and "wikipedia.org/wiki/" in final_url:
             return [
                 SearchResult(
-                    title=_clean_spaces(direct_title.get_text(" ", strip=True)),
-                    url=response.url,
-                    snippet=snippet,
+                    title=parser.heading,
+                    url=final_url,
+                    snippet=parser.first_paragraph,
                     rank=0,
                     source=self.name,
                 )
             ]
-
-        results: list[SearchResult] = []
-        for rank, item in enumerate(soup.select("li.mw-search-result")):
-            link = item.select_one("a[href]")
-            if link is None:
-                continue
-            snippet_node = item.select_one(".searchresult")
-            results.append(
-                SearchResult(
-                    title=_clean_spaces(link.get_text(" ", strip=True)),
-                    url=urljoin("https://en.wikipedia.org/", link.get("href", "")),
-                    snippet=_clean_spaces(snippet_node.get_text(" ", strip=True)) if snippet_node else "",
-                    rank=rank,
-                    source=self.name,
-                )
-            )
-            if len(results) >= max_results:
-                break
-        return results
+        return parser.results[:max_results]
 
 
-class PageFetcher:
-    def __init__(self, config: SearchConfig | None = None, session: requests.Session | None = None) -> None:
-        self.config = config or SearchConfig()
-        self.session = session or requests.Session()
-        self.session.headers.update(
-            {
-                "User-Agent": self.config.user_agent,
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        )
-
+class PageFetcher(_BaseHttpClient):
     def fetch(self, url: str) -> tuple[str, str]:
-        try:
-            response = self.session.get(url, timeout=self.config.timeout_seconds)
-            response.raise_for_status()
-        except requests.RequestException:
-            return "", ""
-
-        content_type = response.headers.get("content-type", "")
+        final_url, html, content_type = self._get(url)
         if "html" not in content_type and "text/plain" not in content_type:
             return "", ""
-        return self._extract_text(response.text, response.url)
+        return self._extract_text(html, final_url or url)
 
     @staticmethod
     def _extract_text(html: str, url: str) -> tuple[str, str]:
-        soup = BeautifulSoup(html, "html.parser")
-        title_node = soup.find("title")
-        title = _clean_spaces(title_node.get_text(" ", strip=True)) if title_node else url
-
-        for node in soup(["script", "style", "noscript", "svg", "img", "header", "footer", "nav", "aside", "form"]):
-            node.decompose()
-
-        container = soup.find("main") or soup.find("article") or soup.body or soup
-        blocks = []
-        for node in container.find_all(["p", "li", "h1", "h2", "h3"]):
-            text = _clean_spaces(node.get_text(" ", strip=True))
-            if len(text) >= 40:
-                blocks.append(text)
-        return title, _clean_spaces("\n".join(blocks))
+        parser = _ContentExtractor()
+        parser.feed(html)
+        title = parser.title or url
+        text = _clean_spaces("\n".join(parser.blocks))
+        return title, text
 
     def fetch_passages(
         self,
@@ -830,6 +1089,8 @@ class Reasoner:
 
     def classify(self, query: str) -> str:
         lowered = query.lower()
+        if self._extract_math_expression(lowered):
+            return "calculation"
         if TIME_SENSITIVE_PATTERN.search(lowered):
             return "time_sensitive"
         if " vs " in lowered or "difference between" in lowered or lowered.startswith("compare "):
@@ -842,9 +1103,35 @@ class Reasoner:
             return "definition"
         return "factoid"
 
+    def try_direct_answer(self, query: str) -> Answer | None:
+        expression = self._extract_math_expression(query)
+        if not expression:
+            return None
+        try:
+            value = self._evaluate_math_expression(expression)
+        except (SyntaxError, ValueError, ZeroDivisionError):
+            return None
+
+        if abs(value - round(value)) < 1e-9:
+            rendered = str(int(round(value)))
+        else:
+            rendered = f"{value:.6f}".rstrip("0").rstrip(".")
+
+        return Answer(
+            text=f"The answer is {rendered}.",
+            confidence=0.99,
+            used_memory=False,
+            used_web=False,
+            query_type="calculation",
+        )
+
+    @staticmethod
+    def is_low_signal_answer(text: str) -> bool:
+        return bool(LOW_SIGNAL_ANSWER_PATTERN.search(text))
+
     def compose(self, query: str, passages: list[Passage], memories: list[MemoryRecord]) -> Answer:
         query_type = self.classify(query)
-        if not passages and memories:
+        if not passages and memories and memories[0].confidence >= 0.45 and not self.is_low_signal_answer(memories[0].answer):
             top_memory = memories[0]
             return Answer(
                 text=top_memory.answer,
@@ -926,6 +1213,51 @@ class Reasoner:
         confidence = 0.2 + 0.7 * min(top_score, 1.0) + 0.05 * min(source_diversity, 3) + memory_bonus
         return round(max(0.1, min(confidence, 0.95)), 3)
 
+    @staticmethod
+    def _extract_math_expression(query: str) -> str:
+        lowered = query.lower().strip()
+        if not MATH_QUERY_PATTERN.search(lowered):
+            return ""
+
+        cleaned = lowered.rstrip("?.! ")
+        for prefix in ("what is ", "what's ", "calculate ", "compute ", "evaluate "):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):]
+                break
+
+        replacements = (
+            ("multiplied by", "*"),
+            ("divided by", "/"),
+            ("plus", "+"),
+            ("minus", "-"),
+            ("times", "*"),
+            ("over", "/"),
+        )
+        for needle, replacement in replacements:
+            cleaned = cleaned.replace(needle, replacement)
+
+        cleaned = cleaned.replace("x", "*")
+        cleaned = re.sub(r"\s+", "", cleaned)
+        if not cleaned or not re.fullmatch(r"[\d\.\+\-\*/\(\)]+", cleaned):
+            return ""
+        return cleaned
+
+    @staticmethod
+    def _evaluate_math_expression(expression: str) -> float:
+        def visit(node: ast.AST) -> float:
+            if isinstance(node, ast.Expression):
+                return visit(node.body)
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return float(node.value)
+            if isinstance(node, ast.UnaryOp) and type(node.op) in SAFE_UNARY_OPERATORS:
+                return SAFE_UNARY_OPERATORS[type(node.op)](visit(node.operand))
+            if isinstance(node, ast.BinOp) and type(node.op) in SAFE_BINARY_OPERATORS:
+                return SAFE_BINARY_OPERATORS[type(node.op)](visit(node.left), visit(node.right))
+            raise ValueError("Unsupported expression")
+
+        parsed = ast.parse(expression, mode="eval")
+        return visit(parsed)
+
 
 class RabbitAI:
     def __init__(
@@ -954,15 +1286,26 @@ class RabbitAI:
         if not query:
             return Answer(text="Please enter a question.", confidence=0.0)
 
+        direct_answer = self.reasoner.try_direct_answer(query)
+        if direct_answer is not None:
+            self.memory.save_interaction(query, direct_answer)
+            return direct_answer
+
         query_type = self.reasoner.classify(query)
         memories = self.memory.recall(query, limit=5)
 
-        if query_type != "time_sensitive" and memories and memories[0].similarity >= self.config.runtime.memory_reuse_threshold:
+        if (
+            query_type != "time_sensitive"
+            and memories
+            and memories[0].similarity >= self.config.runtime.memory_reuse_threshold
+            and memories[0].confidence >= 0.45
+            and not self.reasoner.is_low_signal_answer(memories[0].answer)
+        ):
             top_memory = memories[0]
             answer = Answer(
                 text=top_memory.answer,
                 sources=top_memory.sources,
-                confidence=max(top_memory.confidence, min(0.92, top_memory.similarity)),
+                confidence=round(min(0.92, 0.7 * top_memory.confidence + 0.3 * top_memory.similarity), 3),
                 used_memory=True,
                 used_web=False,
                 query_type=query_type,

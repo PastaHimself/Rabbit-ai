@@ -13,9 +13,6 @@ authors = [
   { name = "PastaHimself" }
 ]
 dependencies = [
-  "torch>=2.2",
-  "requests>=2.31",
-  "beautifulsoup4>=4.12",
 ]
 keywords = ["ai", "assistant", "retrieval", "search", "cli"]
 classifiers = [

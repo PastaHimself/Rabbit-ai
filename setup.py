@@ -15,11 +15,7 @@ setup(
     author="PastaHimself",
     python_requires=">=3.11",
     packages=find_packages(include=["rabbit_ai", "rabbit_ai.*"]),
-    install_requires=[
-        "torch>=2.2",
-        "requests>=2.31",
-        "beautifulsoup4>=4.12",
-    ],
+    install_requires=[],
     entry_points={
         "console_scripts": [
             "rabbit-ai=rabbit_ai.cli:run_cli",

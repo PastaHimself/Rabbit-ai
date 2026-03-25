@@ -106,10 +106,26 @@ class SearchReasoningEngineTests(unittest.TestCase):
 
     def test_reasoner_classifies_query_types(self) -> None:
         reasoner = Reasoner(RuntimeConfig())
+        self.assertEqual(reasoner.classify("what is 1 plus 1"), "calculation")
         self.assertEqual(reasoner.classify("latest Rabbit AI release"), "time_sensitive")
         self.assertEqual(reasoner.classify("Compare HTTP vs HTTPS"), "comparison")
         self.assertEqual(reasoner.classify("How do I boil pasta?"), "how_to")
         self.assertEqual(reasoner.classify("What is Rabbit AI?"), "definition")
+
+    def test_engine_solves_simple_math_without_web(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = RabbitAI(
+                config=RabbitConfig(db_path=f"{temp_dir}/rabbit.db", search=SearchConfig()),
+                memory_store=MemoryStore(db_path=f"{temp_dir}/rabbit.db", cache_ttl_hours=24),
+                search_provider=FakeSearchProvider({}),
+                fallback_provider=FakeSearchProvider({}),
+                page_fetcher=FakePageFetcher({}),
+            )
+            answer = agent.ask("what is 1 plus 1", use_web=True)
+            self.assertEqual(answer.text, "The answer is 2.")
+            self.assertFalse(answer.used_memory)
+            self.assertFalse(answer.used_web)
+            self.assertEqual(answer.query_type, "calculation")
 
     def test_engine_reuses_memory_for_repeated_non_time_sensitive_query(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -148,6 +164,48 @@ class SearchReasoningEngineTests(unittest.TestCase):
             self.assertTrue(second.used_memory)
             self.assertFalse(second.used_web)
             self.assertEqual(search_provider.calls, 1)
+
+    def test_engine_does_not_reuse_low_confidence_failure_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = MemoryStore(db_path=f"{temp_dir}/rabbit.db", cache_ttl_hours=24)
+            store.save_interaction(
+                "What is Rabbit AI?",
+                Answer(
+                    text="I could not find enough reliable information to answer that confidently.",
+                    confidence=0.1,
+                    query_type="definition",
+                ),
+            )
+            search_provider = FakeSearchProvider(
+                {
+                    "What is Rabbit AI?": [
+                        SearchResult(title="Rabbit AI overview", url="https://example.com/rabbit", rank=0, source="fake-search")
+                    ]
+                }
+            )
+            page_fetcher = FakePageFetcher(
+                {
+                    "https://example.com/rabbit": [
+                        Passage(
+                            title="Rabbit AI overview",
+                            url="https://example.com/rabbit",
+                            text="Rabbit AI is a compact assistant that mixes search, ranking, and cached memory for CPU-friendly answers.",
+                            source="fake-search",
+                            rank=0,
+                        )
+                    ]
+                }
+            )
+            agent = RabbitAI(
+                config=RabbitConfig(db_path=f"{temp_dir}/rabbit.db", search=SearchConfig()),
+                memory_store=store,
+                search_provider=search_provider,
+                fallback_provider=FakeSearchProvider({}),
+                page_fetcher=page_fetcher,
+            )
+            answer = agent.ask("What is Rabbit AI?", use_web=True)
+            self.assertNotIn("could not find enough reliable information", answer.text.lower())
+            self.assertTrue(answer.used_web)
 
     def test_engine_uses_fallback_provider_when_primary_is_empty(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

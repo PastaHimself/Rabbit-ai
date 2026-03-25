@@ -35,15 +35,26 @@ class RabbitAI:
         if not query:
             return Answer(text="Please enter a question.", confidence=0.0)
 
+        direct_answer = self.reasoner.try_direct_answer(query)
+        if direct_answer is not None:
+            self.memory.save_interaction(query, direct_answer)
+            return direct_answer
+
         query_type = self.reasoner.classify(query)
         memories = self.memory.recall(query, limit=5)
 
-        if query_type != "time_sensitive" and memories and memories[0].similarity >= self.config.runtime.memory_reuse_threshold:
+        if (
+            query_type != "time_sensitive"
+            and memories
+            and memories[0].similarity >= self.config.runtime.memory_reuse_threshold
+            and memories[0].confidence >= 0.45
+            and not self.reasoner.is_low_signal_answer(memories[0].answer)
+        ):
             top_memory = memories[0]
             answer = Answer(
                 text=top_memory.answer,
                 sources=top_memory.sources,
-                confidence=max(top_memory.confidence, min(0.92, top_memory.similarity)),
+                confidence=round(min(0.92, 0.7 * top_memory.confidence + 0.3 * top_memory.similarity), 3),
                 used_memory=True,
                 used_web=False,
                 query_type=query_type,

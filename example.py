@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,9 +25,10 @@ except ModuleNotFoundError as exc:
     from rabbit_ai_combined import RabbitAI
 
 
-APP = RabbitAI()
-HOST = "127.0.0.1"
-PORT = 8000
+APP: RabbitAI | None = None
+APP_INIT_ERROR: str | None = None
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
 
 
 HTML_PAGE = """<!doctype html>
@@ -283,6 +285,14 @@ class RabbitWebHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
 
+        app = get_app()
+        if app is None:
+            self._send_json(
+                {"error": APP_INIT_ERROR or "Rabbit AI failed to initialize."},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length)
 
@@ -300,9 +310,9 @@ class RabbitWebHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            answer = APP.ask(query, use_web=use_web)
-        except Exception:
-            self._send_json({"error": "Rabbit AI failed to process the request."}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            answer = app.ask(query, use_web=use_web)
+        except Exception as exc:
+            self._send_json({"error": f"Rabbit AI failed to process the request: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
 
         self._send_json(
@@ -327,6 +337,23 @@ class RabbitWebHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def get_app() -> RabbitAI | None:
+    global APP
+    global APP_INIT_ERROR
+
+    if APP is not None:
+        return APP
+    if APP_INIT_ERROR is not None:
+        return None
+
+    try:
+        APP = RabbitAI()
+    except Exception as exc:
+        APP_INIT_ERROR = str(exc)
+        return None
+    return APP
 
 
 def run() -> None:

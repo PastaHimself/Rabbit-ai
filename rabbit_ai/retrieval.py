@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import math
 import re
 from collections import Counter
 from dataclasses import replace
 from urllib.parse import urlparse
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:
+    torch = None
 
 from .config import DEFAULT_STOPWORDS, RankingWeights
 from .types import Passage
@@ -44,7 +48,7 @@ def dense_keyword_query(text: str, limit: int = 8) -> str:
 class SimpleTfidfVectorizer:
     def __init__(self) -> None:
         self.vocabulary_: dict[str, int] = {}
-        self.idf_: torch.Tensor | None = None
+        self.idf_: object | None = None
 
     def fit(self, documents: list[str]) -> "SimpleTfidfVectorizer":
         token_lists = [tokenize(doc) for doc in documents]
@@ -52,25 +56,48 @@ class SimpleTfidfVectorizer:
         self.vocabulary_ = {token: index for index, token in enumerate(vocabulary)}
         document_count = len(documents)
         if not vocabulary:
-            self.idf_ = torch.zeros(0, dtype=torch.float32)
+            self.idf_ = torch.zeros(0, dtype=torch.float32) if torch is not None else []
             return self
 
-        document_frequencies = torch.zeros(len(vocabulary), dtype=torch.float32)
+        if torch is not None:
+            document_frequencies = torch.zeros(len(vocabulary), dtype=torch.float32)
+            for tokens in token_lists:
+                for token in set(tokens):
+                    document_frequencies[self.vocabulary_[token]] += 1.0
+            self.idf_ = torch.log((1.0 + document_count) / (1.0 + document_frequencies)) + 1.0
+            return self
+
+        document_frequencies = [0.0] * len(vocabulary)
         for tokens in token_lists:
             for token in set(tokens):
                 document_frequencies[self.vocabulary_[token]] += 1.0
-
-        self.idf_ = torch.log((1.0 + document_count) / (1.0 + document_frequencies)) + 1.0
+        self.idf_ = [math.log((1.0 + document_count) / (1.0 + frequency)) + 1.0 for frequency in document_frequencies]
         return self
 
-    def transform(self, documents: list[str]) -> torch.Tensor:
+    def transform(self, documents: list[str]):
         if self.idf_ is None:
             raise ValueError("SimpleTfidfVectorizer must be fitted before transform().")
 
-        matrix = torch.zeros((len(documents), len(self.vocabulary_)), dtype=torch.float32)
-        if not self.vocabulary_:
+        if torch is not None:
+            matrix = torch.zeros((len(documents), len(self.vocabulary_)), dtype=torch.float32)
+            if not self.vocabulary_:
+                return matrix
+            for row_index, document in enumerate(documents):
+                counts = Counter(tokenize(document))
+                if not counts:
+                    continue
+                total_tokens = float(sum(counts.values()))
+                for token, count in counts.items():
+                    column = self.vocabulary_.get(token)
+                    if column is None:
+                        continue
+                    tf = count / total_tokens
+                    matrix[row_index, column] = tf * self.idf_[column]
             return matrix
 
+        matrix = [[0.0] * len(self.vocabulary_) for _ in documents]
+        if not self.vocabulary_:
+            return matrix
         for row_index, document in enumerate(documents):
             counts = Counter(tokenize(document))
             if not counts:
@@ -81,27 +108,41 @@ class SimpleTfidfVectorizer:
                 if column is None:
                     continue
                 tf = count / total_tokens
-                matrix[row_index, column] = tf * self.idf_[column]
+                matrix[row_index][column] = tf * self.idf_[column]
         return matrix
 
-    def fit_transform(self, documents: list[str]) -> torch.Tensor:
+    def fit_transform(self, documents: list[str]):
         self.fit(documents)
         return self.transform(documents)
 
 
-def cosine_similarity(query_vector: torch.Tensor, document_matrix: torch.Tensor) -> list[float]:
-    if document_matrix.numel() == 0:
+def cosine_similarity(query_vector, document_matrix) -> list[float]:
+    if torch is not None and hasattr(document_matrix, "numel"):
+        if document_matrix.numel() == 0:
+            return []
+        query_norm = torch.linalg.vector_norm(query_vector)
+        if torch.isclose(query_norm, query_vector.new_tensor(0.0)):
+            return [0.0] * len(document_matrix)
+        document_norms = torch.linalg.vector_norm(document_matrix, dim=1)
+        safe_norms = torch.where(document_norms == 0, torch.ones_like(document_norms), document_norms)
+        scores = torch.matmul(document_matrix, query_vector) / (safe_norms * query_norm)
+        scores = torch.where(document_norms == 0, torch.zeros_like(scores), scores)
+        return [float(value) for value in scores.tolist()]
+
+    if not document_matrix:
         return []
-
-    query_norm = torch.linalg.vector_norm(query_vector)
-    if torch.isclose(query_norm, query_vector.new_tensor(0.0)):
+    query_norm = math.sqrt(sum(value * value for value in query_vector))
+    if query_norm == 0:
         return [0.0] * len(document_matrix)
-
-    document_norms = torch.linalg.vector_norm(document_matrix, dim=1)
-    safe_norms = torch.where(document_norms == 0, torch.ones_like(document_norms), document_norms)
-    scores = torch.matmul(document_matrix, query_vector) / (safe_norms * query_norm)
-    scores = torch.where(document_norms == 0, torch.zeros_like(scores), scores)
-    return [float(value) for value in scores.tolist()]
+    scores: list[float] = []
+    for document_vector in document_matrix:
+        document_norm = math.sqrt(sum(value * value for value in document_vector))
+        if document_norm == 0:
+            scores.append(0.0)
+            continue
+        dot_product = sum(document_value * query_value for document_value, query_value in zip(document_vector, query_vector, strict=True))
+        scores.append(dot_product / (document_norm * query_norm))
+    return scores
 
 
 def keyword_overlap_score(query_text: str, candidate_text: str) -> float:

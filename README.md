@@ -44,11 +44,10 @@ python -m venv .venv
 
 3. Install Rabbit AI from this local checkout.
 ```powershell
-pip install -r requirements.txt
 pip install --no-deps --no-build-isolation -e .
 ```
 
-Rabbit AI now uses a PyTorch backend for retrieval and ranking. The package install needs `torch`, and the single-file fallback path also keeps `requests` and `beautifulsoup4`.
+Rabbit AI runs without third-party runtime packages by default. If `torch` is already installed on the machine, the retrieval code will use it as an optional acceleration path.
 
 Do not run `pip install rabbit-ai` on a private or offline server unless you have mirrored the package to your own index. That command asks `pip` to fetch `rabbit-ai` from the configured package index, which is why you see retries against `pypi.org`.
 
@@ -221,7 +220,7 @@ The single-file script is a convenience snapshot and may lag behind the modular 
 Completed:
 - Kept the modular package as the primary supported install target
 - Added `unittest` coverage for retrieval, memory, search parsing, reasoning, and engine fallbacks
-- Switched the retrieval and ranking backend to PyTorch
+- Kept the default runtime dependency-light for private or offline deployments
 - Confirmed there is no required GPU usage, no TensorFlow, and no external AI API dependency
 
 Blocked in this workspace:

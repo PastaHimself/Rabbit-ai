@@ -1,3 +1,1 @@
-torch>=2.2
-requests>=2.31
-beautifulsoup4>=4.12
+# No third-party runtime dependencies are required.

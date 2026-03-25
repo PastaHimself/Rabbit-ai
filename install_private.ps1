@@ -31,7 +31,6 @@ function Resolve-PythonInvocation {
 $python = Resolve-PythonInvocation -Preferred $PythonCommand
 
 Write-Host "Installing Rabbit AI from the local checkout..."
-& $python.Executable @($python.PrefixArgs + @("-m", "pip", "install", "-r", "requirements.txt"))
 & $python.Executable @($python.PrefixArgs + @("-m", "pip", "install", "--no-deps", "--no-build-isolation", "-e", "."))
 
 Write-Host "Install complete. Run 'rabbit-ai' or '$($python.Display) -m rabbit_ai'."
