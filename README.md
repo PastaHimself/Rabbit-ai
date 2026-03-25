@@ -42,7 +42,12 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-3. Install the package in editable mode.
+3. Install from the package index.
+```powershell
+pip install rabbit-ai
+```
+
+For local development, install the package in editable mode instead.
 ```powershell
 pip install -e .
 ```
