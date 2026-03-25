@@ -42,12 +42,17 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-3. Install the lightweight dependencies.
+3. Install the package in editable mode.
 ```powershell
-pip install -r requirements.txt
+pip install -e .
 ```
 
 4. Run the CLI assistant.
+```powershell
+rabbit-ai
+```
+
+You can also run it as a module:
 ```powershell
 python -m rabbit_ai.cli
 ```
@@ -217,3 +222,14 @@ Blocked in this workspace:
 Reason:
 - `python` is not currently installed or not available on `PATH` in this environment
 
+## Packaging
+
+Rabbit AI is now installable as a Python package with:
+- Package metadata in `pyproject.toml`
+- CLI entry point: `rabbit-ai`
+- Module entry point: `python -m rabbit_ai`
+
+To build distributable artifacts later:
+```powershell
+python -m build
+```

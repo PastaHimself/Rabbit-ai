@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rabbit-ai"
+version = "0.1.0"
+description = "A lightweight retrieval-first local AI assistant."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+  { name = "PastaHimself" }
+]
+dependencies = [
+  "numpy>=1.24",
+  "requests>=2.31",
+  "beautifulsoup4>=4.12",
+]
+keywords = ["ai", "assistant", "retrieval", "search", "cli"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.scripts]
+rabbit-ai = "rabbit_ai.cli:run_cli"
+
+[tool.setuptools.packages.find]
+include = ["rabbit_ai*"]
